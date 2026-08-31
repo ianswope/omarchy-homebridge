@@ -1,0 +1,138 @@
+#!/bin/bash
+
+# Set one characteristic on one Homebridge accessory: On to true/false, or
+# Brightness to a percentage. This is the only thing in the plugin that reaches
+# out and changes something in the physical world, so every value it will send
+# is proven — not defaulted, not clamped after the fact — before it is built
+# into a request.
+#
+#   omarchy-homebridge-set <config> <uniqueId> <characteristicType> <value>
+#
+# characteristicType is allow-listed to exactly On and Brightness. A value that
+# is not a boolean (for On) or an integer 0..100 (for Brightness) is refused
+# here rather than sent and hoped about.
+
+set -o pipefail
+
+CONFIG="${1:-$HOME/.config/omarchy-homebridge/config.json}"
+[[ $CONFIG == "~"* ]] && CONFIG="$HOME${CONFIG#\~}"
+UNIQUE_ID="$2"
+CHAR_TYPE="$3"
+VALUE="$4"
+
+CURL_DEADLINE=8
+LOGIN_MAX_BYTES=1048576
+
+fail_json() {
+  jq -n --arg error "$1" '{ok:false, error:$error}'
+  exit 0
+}
+
+CONFIG_LIB="${BASH_SOURCE[0]%/*}/homebridge-config.sh"
+if ! source "$CONFIG_LIB" 2>/dev/null; then
+  printf '{"ok":false,"error":"cannot read homebridge-config.sh next to this helper"}\n'
+  exit 0
+fi
+
+command -v jq >/dev/null 2>&1 || { printf '{"ok":false,"error":"jq is not installed"}\n'; exit 0; }
+command -v curl >/dev/null 2>&1 || { printf '{"ok":false,"error":"curl is not installed"}\n'; exit 0; }
+
+[[ $CONFIG == /* ]] || fail_json "config path must be absolute: $CONFIG"
+
+# The uniqueId is spliced into a URL path, so it is checked against the shape
+# config-ui-x issues rather than trusted.
+is_unique_id "$UNIQUE_ID" || fail_json "unexpected characters in the accessory id"
+
+# The characteristic is one of exactly two verbs. Anything else — a name the
+# panel would never send — stops here.
+case "$CHAR_TYPE" in
+  On|Brightness) ;;
+  *) fail_json "this plugin only sets On or Brightness" ;;
+esac
+
+# The value is turned into a JSON literal only after it is proven to be one.
+# --argjson then embeds a literal true/false/number, so there is nothing left
+# for a crafted value to inject: it was digits or it was a keyword, or we are
+# already gone.
+case "$CHAR_TYPE" in
+  On)
+    case "$VALUE" in
+      true|false) VALUE_JSON="$VALUE" ;;
+      *) fail_json "On takes true or false" ;;
+    esac
+    ;;
+  Brightness)
+    [[ $VALUE =~ ^[0-9]+$ ]] || fail_json "Brightness takes a whole number 0-100"
+    (( VALUE > 100 )) && fail_json "Brightness cannot exceed 100"
+    VALUE_JSON="$VALUE"
+    ;;
+esac
+
+# Read once, parse only what came back. This helper changes a device, so the
+# file it acts on should not be able to turn into something else between being
+# checked and being used.
+CONFIG_JSON=$(read_config_json "$CONFIG")
+read_rc=$?
+(( read_rc == 0 )) || fail_json "$(config_read_error "$read_rc" "$CONFIG")"
+jq -e . <<<"$CONFIG_JSON" >/dev/null 2>&1 || fail_json "config is not valid JSON: $CONFIG"
+
+URL=$(jq -r '.url // ""' <<<"$CONFIG_JSON")
+[[ -n $URL ]] || fail_json "no \"url\" in $CONFIG"
+if [[ $URL != http://* && $URL != https://* ]]; then
+  fail_json "url must begin with http:// or https://"
+fi
+is_safe_config_value "$URL" || fail_json "the url in $CONFIG contains characters that cannot be used safely"
+URL="${URL%/}"
+
+login_err=$(mktemp -t omarchy-homebridge-loginerr.XXXXXX) || fail_json "cannot create a temporary file"
+body=$(mktemp -t omarchy-homebridge-put.XXXXXX) || { rm -f "$login_err"; fail_json "cannot create a temporary file"; }
+chmod 600 -- "$body" 2>/dev/null
+trap 'rm -f "$login_err" "$body"' EXIT
+
+if ! hb_ensure_token "$LOGIN_MAX_BYTES" "$CONFIG" "$CONFIG_JSON" "$CURL_DEADLINE" 2>"$login_err"; then
+  err=$(tr -cd '[:print:]' < "$login_err" 2>/dev/null | cut -c1-160)
+  fail_json "${err:-could not sign in to Homebridge}"
+fi
+
+# The body is built by jq with the proven literal, so its JSON is well formed
+# and its value is exactly what was validated above.
+jq -n --arg ct "$CHAR_TYPE" --argjson v "$VALUE_JSON" '{characteristicType:$ct, value:$v}' > "$body" \
+  || fail_json "could not encode the request"
+
+NOW=$(date +%s)
+
+put_characteristic() {
+  # Token and body reach curl through a stdin config document; neither the
+  # bearer token nor anything else is on the command line.
+  printf 'request = "PUT"\nheader = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\nheader = "Accept: application/json"\nurl = "%s/api/accessories/%s"\ndata = "@%s"\nmax-time = %s\noutput = "/dev/null"\nsilent\nshow-error\nwrite-out = "%%{http_code}"\n' \
+    "$HB_TOKEN" "$URL" "$UNIQUE_ID" "$body" "$CURL_DEADLINE" | curl --config - 2>/dev/null
+}
+
+http_code=$(put_characteristic)
+curl_status=$?
+
+# A cached token rejected before expiry: one forced re-login and retry.
+if (( curl_status == 0 )) && [[ $http_code == 401 ]]; then
+  login_json=$(hb_login "$LOGIN_MAX_BYTES" "$URL" "$(jq -r '.username // ""' <<<"$CONFIG_JSON")" "$(jq -r '.password // ""' <<<"$CONFIG_JSON")" "$CURL_DEADLINE" 2>/dev/null)
+  new_token=$(jq -r '.access_token // empty' <<<"$login_json" 2>/dev/null)
+  if is_jwt "$new_token"; then
+    HB_TOKEN="$new_token"
+    ttl=$(jq -r '.expires_in // empty' <<<"$login_json" 2>/dev/null); is_number "$ttl" || ttl=$TOKEN_DEFAULT_TTL
+    (( ttl > TOKEN_MAX_TTL )) && ttl=$TOKEN_MAX_TTL
+    hb_persist_token "$CONFIG" "$CONFIG_JSON" "$new_token" "$(( NOW + ttl - TOKEN_SAFETY_MARGIN ))" 2>/dev/null || true
+    http_code=$(put_characteristic)
+    curl_status=$?
+  fi
+fi
+
+if (( curl_status != 0 )); then
+  fail_json "cannot reach $URL"
+fi
+
+case "$http_code" in
+  2*)  jq -n '{ok:true, error:""}' ;;
+  400) fail_json "Homebridge refused the request (400)" ;;
+  401) fail_json "Homebridge rejected the credentials (401)" ;;
+  404) fail_json "Homebridge no longer knows that accessory (404)" ;;
+  *)   fail_json "Homebridge answered HTTP $http_code" ;;
+esac

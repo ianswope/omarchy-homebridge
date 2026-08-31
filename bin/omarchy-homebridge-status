@@ -1,0 +1,168 @@
+#!/bin/bash
+
+# Emit one JSON document describing every controllable accessory Homebridge
+# bridges: its name, type, whether it is on, and — for a dimmable light — its
+# brightness. "Controllable" here means it exposes a writable On characteristic,
+# which is the one thing this plugin acts on.
+#
+# A reporter. It never toggles anything; the one action that does lives in
+# omarchy-homebridge-set and is called explicitly by the panel.
+#
+# The server address and credentials come from a JSON config outside the plugin
+# directory, so nothing sensitive is ever in the repo or in the bar's settings.
+
+set -o pipefail
+
+CONFIG="${1:-$HOME/.config/omarchy-homebridge/config.json}"
+# The path arrives as an argument, so no shell expands a leading tilde for us.
+[[ $CONFIG == "~"* ]] && CONFIG="$HOME${CONFIG#\~}"
+
+CURL_DEADLINE=8
+# A large Homebridge might bridge a few hundred accessories; each is on the
+# order of a kilobyte, so a megabyte is generous and still cheap to read every
+# few seconds. Past it is a fault, not data.
+MAX_BYTES=2097152
+LOGIN_MAX_BYTES=1048576
+# And a ceiling on rows, so a merely enormous-but-valid reply cannot become an
+# enormous panel.
+MAX_ITEMS=300
+
+fail_json() {
+  jq -n --arg error "$1" --arg config "$CONFIG" \
+    '{ok:false, error:$error, configured:true, configPath:$config, accessories:[], totals:{}}'
+  exit 0
+}
+
+CONFIG_LIB="${BASH_SOURCE[0]%/*}/homebridge-config.sh"
+if ! source "$CONFIG_LIB" 2>/dev/null; then
+  printf '{"ok":false,"error":"cannot read homebridge-config.sh next to this helper","accessories":[]}\n'
+  exit 0
+fi
+
+command -v jq >/dev/null 2>&1 || { printf '{"ok":false,"error":"jq is not installed","accessories":[]}\n'; exit 0; }
+command -v curl >/dev/null 2>&1 || { printf '{"ok":false,"error":"curl is not installed","accessories":[]}\n'; exit 0; }
+
+# An absolute path is required: a leading dash would be read as an option
+# downstream, and a relative path means whatever directory the shell started in.
+if [[ $CONFIG != /* ]]; then
+  fail_json "config path must be absolute: $CONFIG"
+fi
+
+# Read once. Every jq below parses these bytes; nothing reopens the path.
+CONFIG_JSON=$(read_config_json "$CONFIG")
+read_rc=$?
+
+if (( read_rc == 1 )); then
+  # Not an error: a fresh install has nothing configured yet, and the panel says
+  # so with the path to create.
+  jq -n --arg config "$CONFIG" \
+    '{ok:true, error:"", configured:false, configPath:$config, now:0, serverUrl:"", accessories:[], totals:{count:0, on:0}}'
+  exit 0
+fi
+(( read_rc == 0 )) || fail_json "$(config_read_error "$read_rc" "$CONFIG")"
+
+jq -e . <<<"$CONFIG_JSON" >/dev/null 2>&1 || fail_json "config is not valid JSON: $CONFIG"
+
+URL=$(jq -r '.url // ""' <<<"$CONFIG_JSON")
+[[ -n $URL ]] || fail_json "no \"url\" in $CONFIG"
+if [[ $URL != http://* && $URL != https://* ]]; then
+  fail_json "url must begin with http:// or https://"
+fi
+is_safe_config_value "$URL" || fail_json "the url in $CONFIG contains characters that cannot be used safely"
+URL="${URL%/}"
+
+# Obtain a session token, refreshing through a login if the cached one is gone
+# or near expiry. hb_ensure_token persists a refreshed token back to the config
+# and sets HB_TOKEN in this shell, so it is called directly rather than in a
+# subshell — its stderr is captured through an mktemp'd file, not a $$ path.
+login_err=$(mktemp -t omarchy-homebridge-loginerr.XXXXXX) || fail_json "cannot create a temporary file"
+trap 'rm -f "$login_err"' EXIT
+if ! hb_ensure_token "$LOGIN_MAX_BYTES" "$CONFIG" "$CONFIG_JSON" "$CURL_DEADLINE" 2>"$login_err"; then
+  err=$(tr -cd '[:print:]' < "$login_err" 2>/dev/null | cut -c1-160)
+  fail_json "${err:-could not sign in to Homebridge}"
+fi
+
+NOW=$(date +%s)
+
+# The token goes in a header read from a --config document on stdin, never on
+# the command line: curl's argv is visible in /proc, and this is a bearer token.
+# The body lands in a file and is refused past MAX_BYTES; whatever answers on
+# that port is not necessarily a healthy Homebridge, and reading an unbounded
+# reply into memory on a timer is how a widget takes the machine down.
+tmp=$(mktemp -t omarchy-homebridge-status.XXXXXX) || fail_json "cannot create a temporary file"
+trap 'rm -f "$tmp" "$login_err"' EXIT
+
+get_accessories() {
+  printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\nurl = "%s/api/accessories"\nmax-time = %s\nmax-filesize = %s\noutput = "%s"\nsilent\nshow-error\nwrite-out = "%%{http_code}"\n' \
+    "$HB_TOKEN" "$URL" "$CURL_DEADLINE" "$MAX_BYTES" "$tmp" | curl --config - 2>/dev/null
+}
+
+http_code=$(get_accessories)
+curl_status=$?
+
+if (( curl_status != 0 )); then
+  if (( curl_status == 63 )); then
+    fail_json "Homebridge returned more than $((MAX_BYTES / 1024)) KB of accessory data"
+  fi
+  fail_json "cannot reach $URL"
+fi
+
+# A cached token can be rejected before its own expiry — config-ui-x restarted,
+# or its secret rotated. One forced re-login and retry, then give up.
+if [[ $http_code == 401 ]]; then
+  login_json=$(hb_login "$LOGIN_MAX_BYTES" "$URL" "$(jq -r '.username // ""' <<<"$CONFIG_JSON")" "$(jq -r '.password // ""' <<<"$CONFIG_JSON")" "$CURL_DEADLINE" 2>/dev/null)
+  new_token=$(jq -r '.access_token // empty' <<<"$login_json" 2>/dev/null)
+  if is_jwt "$new_token"; then
+    HB_TOKEN="$new_token"
+    ttl=$(jq -r '.expires_in // empty' <<<"$login_json" 2>/dev/null); is_number "$ttl" || ttl=$TOKEN_DEFAULT_TTL
+    (( ttl > TOKEN_MAX_TTL )) && ttl=$TOKEN_MAX_TTL
+    hb_persist_token "$CONFIG" "$CONFIG_JSON" "$new_token" "$(( NOW + ttl - TOKEN_SAFETY_MARGIN ))" 2>/dev/null || true
+    http_code=$(get_accessories)
+    curl_status=$?
+    (( curl_status == 0 )) || fail_json "cannot reach $URL"
+  fi
+fi
+
+# max-filesize only acts on a declared Content-Length, so a chunked reply can
+# still overrun it. The size on disk is the fact that cannot be lied about.
+size=$(stat -c %s -- "$tmp" 2>/dev/null || echo 0)
+if (( size > MAX_BYTES )); then
+  fail_json "Homebridge returned more than $((MAX_BYTES / 1024)) KB of accessory data"
+fi
+
+if [[ $http_code == 401 ]]; then
+  fail_json "Homebridge rejected the credentials (401)"
+fi
+if [[ $http_code != 200 ]]; then
+  fail_json "Homebridge answered HTTP $http_code"
+fi
+
+jq -e . -- "$tmp" >/dev/null 2>&1 || fail_json "Homebridge returned data that is not JSON"
+
+# Reduce the accessory list to the controllable subset, in the shape the panel
+# reads. Only accessories with a WRITABLE On characteristic and a uniqueId
+# survive — everything else cannot be toggled and has no place in a control
+# panel. Brightness is carried when the accessory also exposes a writable one.
+jq --argjson now "$NOW" --arg url "$URL" --argjson maxitems "$MAX_ITEMS" '
+  def as_bool: (. == true) or (. == 1);
+  ( if type == "array" then . else [] end )
+  | map(
+      . as $a
+      | ($a.serviceCharacteristics // []) as $chars
+      | (first($chars[] | select(.type == "On")) // null) as $on
+      | (first($chars[] | select(.type == "Brightness")) // null) as $bri
+      | select($on != null and ($on.canWrite == true))
+      | select(($a.uniqueId // "") != "")
+      | {
+          uniqueId: $a.uniqueId,
+          name: ($a.serviceName // $a.humanType // $a.type // "Accessory"),
+          type: ($a.humanType // $a.type // ""),
+          on: ($on.value | as_bool),
+          dimmable: ($bri != null and ($bri.canWrite == true)),
+          brightness: (if $bri != null then ($bri.value // null) else null end)
+        }
+    )
+  | .[0:$maxitems]
+  | { ok:true, error:"", configured:true, configPath:"'"$CONFIG"'", now:$now, serverUrl:$url,
+      accessories:., totals:{ count: length, on: (map(select(.on)) | length) } }
+' -- "$tmp"
