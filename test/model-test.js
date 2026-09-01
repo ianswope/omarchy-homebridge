@@ -97,6 +97,9 @@ assertEqual(JSON.stringify(Model.securityModes(alarm)),
 assertEqual(Model.securityModes(alarm).length, 3, 'so no Night button appears for a system without one')
 assertEqual(Model.securityModes({ kind: 'security', securityModes: [] }).length, 4,
   'a system that declares nothing is offered all four rather than none')
+assertEqual(Model.securityModes(null).length, 0,
+  'but no accessory at all is no modes — a delegate built before its accessory is bound must not flash four chips')
+assertEqual(Model.securityModes(lamp).length, 0, 'and a light has no modes to offer')
 assertEqual(parse([Object.assign({}, alarm, { securityModes: [0, 1, 9, 'x', 3] })]).accessories[0].securityModes.length, 3,
   'a declared mode outside HomeKit is dropped at the parse boundary')
 

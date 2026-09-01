@@ -65,7 +65,12 @@ function securityLabel(code) {
 // [0,1,3] and has no Night at all, so offering a hardcoded four would put a
 // button on screen whose only possible outcome is the server refusing it.
 function securityModes(a) {
-  var declared = (a && Array.isArray(a.securityModes)) ? a.securityModes : []
+  // No accessory is no modes. The fallback below is for a system that exists
+  // but declares nothing — reaching it with null would put four chips on screen
+  // during the instant a delegate is built before its accessory is bound, and a
+  // Night button that should never have existed can stick there.
+  if (!a || a.kind !== "security") return []
+  var declared = Array.isArray(a.securityModes) ? a.securityModes : []
   var allowed = declared.length > 0 ? declared : [0, 1, 2, 3]
   var out = []
   for (var i = 0; i < SECURITY_MODES.length; i++) {
