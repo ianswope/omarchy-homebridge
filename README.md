@@ -44,6 +44,41 @@ An away mode gives you a minute to leave the house, and the row says `Arming…`
 
 A security system declares which modes it accepts. A SimpliSafe bridge, for instance, declares Home, Away and Off and has **no Night mode at all**. The panel offers exactly what the accessory declares, so there is never a button whose only possible outcome is the server refusing it.
 
+## Install
+
+Requires Omarchy 4 ("Quattro", the Quickshell bar), plus `curl` and `jq`.
+
+```bash
+omarchy plugin add https://github.com/ianswope/omarchy-homebridge.git
+omarchy plugin enable ianswope.homebridge
+```
+
+To put it somewhere else in the bar:
+
+```bash
+omarchy bar move ianswope.homebridge --section right
+```
+
+Then sign in, below. Until you do, the panel says so and the bar stays quiet.
+
+## Remove
+
+```bash
+omarchy plugin remove ianswope.homebridge
+```
+
+That takes the plugin and its bar entry with it. Your Homebridge credential
+lives **outside** the plugin directory, so removing the plugin deliberately
+leaves it alone — delete it yourself if you are done with it:
+
+```bash
+rm -rf ~/.config/omarchy-homebridge
+```
+
+Nothing else on your system is touched: the plugin writes only that one file,
+installs no packages, and changes no Homebridge settings — the non-admin user
+it asks for cannot change them even if it tried.
+
 ## Sign in
 
 Press `l` in the panel, or run:
