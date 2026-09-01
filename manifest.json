@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "ianswope.homebridge",
   "name": "Homebridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Ian Swope",
   "license": "MIT",
-  "description": "Control the HomeKit accessories your Homebridge bridges, from the Omarchy bar: a live count of what is on, and one click to toggle any light, switch or outlet — or dim a light — without opening an app.",
+  "description": "Your home in the Omarchy bar: arm and disarm the security system Homebridge bridges, toggle and dim the lights, and read the sensors — contact, motion, smoke, leak — without opening an app.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,14 +14,16 @@
   },
   "barWidget": {
     "displayName": "Homebridge",
-    "description": "Your Homebridge accessories in the bar: a live count of what is on, one click to toggle any light, switch or outlet, and a slider to set a dimmable light's brightness. Talks to Homebridge over its local API with a dedicated, non-admin user.",
+    "description": "Homebridge in the bar. Sets the security system's mode (asking first), toggles any light, switch or outlet, dims a dimmable light, and reads contact, motion, smoke, CO, leak, temperature and humidity sensors. Talks to Homebridge over its local API with a dedicated, non-admin user.",
     "category": "Home",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 15,
       "showCount": true,
-      "configPath": ""
+      "configPath": "",
+      "showSecurity": true,
+      "temperatureUnit": "Celsius"
     },
     "schema": [
       {
@@ -36,8 +38,27 @@
       {
         "key": "showCount",
         "type": "boolean",
-        "label": "Show the number of devices that are on",
-        "defaultValue": true
+        "label": "Show the number of lights and switches that are on",
+        "defaultValue": true,
+        "description": "Shown in the bar beside the icon. A home with nothing on shows nothing."
+      },
+      {
+        "key": "showSecurity",
+        "type": "boolean",
+        "label": "Show the security system's mode in the bar",
+        "defaultValue": true,
+        "description": "Shows Home, Away or Night beside the icon while the system is armed, and nothing while it is off. An alarm going off always shows, whatever this is set to."
+      },
+      {
+        "key": "temperatureUnit",
+        "type": "enum",
+        "label": "Temperature",
+        "options": [
+          "Celsius",
+          "Fahrenheit"
+        ],
+        "defaultValue": "Celsius",
+        "description": "HomeKit always reports Celsius. This is only how it is read out."
       },
       {
         "key": "configPath",

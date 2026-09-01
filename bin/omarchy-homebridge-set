@@ -1,16 +1,25 @@
 #!/bin/bash
 
-# Set one characteristic on one Homebridge accessory: On to true/false, or
-# Brightness to a percentage. This is the only thing in the plugin that reaches
-# out and changes something in the physical world, so every value it will send
-# is proven — not defaulted, not clamped after the fact — before it is built
-# into a request.
+# Set one characteristic on one Homebridge accessory: On to true/false,
+# Brightness to a percentage, or SecuritySystemTargetState to a HomeKit mode.
+# This is the only thing in the plugin that reaches out and changes something in
+# the physical world, so every value it will send is proven — not defaulted, not
+# clamped after the fact — before it is built into a request.
 #
 #   omarchy-homebridge-set <config> <uniqueId> <characteristicType> <value>
 #
-# characteristicType is allow-listed to exactly On and Brightness. A value that
-# is not a boolean (for On) or an integer 0..100 (for Brightness) is refused
+# characteristicType is allow-listed to exactly On, Brightness and
+# SecuritySystemTargetState. A value that is not a boolean (On), an integer
+# 0..100 (Brightness) or one of 0,1,2,3 (SecuritySystemTargetState) is refused
 # here rather than sent and hoped about.
+#
+# Arming and disarming is in this list because a bar widget that can turn the
+# lights off but not set the alarm is the wrong half. It is deliberately NOT
+# treated like a light: the panel asks before it sends one of these, and this
+# helper still refuses anything outside the four modes HomeKit defines. Which of
+# those four a given system actually accepts is the accessory's business — it
+# declares them, the panel offers only those, and a mode the system does not
+# support comes back as a 400 rather than being guessed at here.
 
 set -o pipefail
 
@@ -46,8 +55,8 @@ is_unique_id "$UNIQUE_ID" || fail_json "unexpected characters in the accessory i
 # The characteristic is one of exactly two verbs. Anything else — a name the
 # panel would never send — stops here.
 case "$CHAR_TYPE" in
-  On|Brightness) ;;
-  *) fail_json "this plugin only sets On or Brightness" ;;
+  On|Brightness|SecuritySystemTargetState) ;;
+  *) fail_json "this plugin only sets On, Brightness or SecuritySystemTargetState" ;;
 esac
 
 # The value is turned into a JSON literal only after it is proven to be one.
@@ -65,6 +74,16 @@ case "$CHAR_TYPE" in
     [[ $VALUE =~ ^[0-9]+$ ]] || fail_json "Brightness takes a whole number 0-100"
     (( VALUE > 100 )) && fail_json "Brightness cannot exceed 100"
     VALUE_JSON="$VALUE"
+    ;;
+  SecuritySystemTargetState)
+    # The four HomeKit modes and nothing else: 0 home, 1 away, 2 night,
+    # 3 disarm. Matched literally rather than range-checked, because this is the
+    # one value in the plugin whose neighbours are not merely wrong but are a
+    # different instruction to a burglar alarm.
+    case "$VALUE" in
+      0|1|2|3) VALUE_JSON="$VALUE" ;;
+      *) fail_json "SecuritySystemTargetState takes 0 (home), 1 (away), 2 (night) or 3 (disarm)" ;;
+    esac
     ;;
 esac
 

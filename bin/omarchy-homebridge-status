@@ -1,11 +1,20 @@
 #!/bin/bash
 
-# Emit one JSON document describing every controllable accessory Homebridge
-# bridges: its name, type, whether it is on, and — for a dimmable light — its
-# brightness. "Controllable" here means it exposes a writable On characteristic,
-# which is the one thing this plugin acts on.
+# Emit one JSON document describing the accessories Homebridge bridges that this
+# plugin has something to say about, in three kinds:
 #
-# A reporter. It never toggles anything; the one action that does lives in
+#   switch    a writable On — lights, switches, outlets, fans. Toggled, and
+#             dimmed when it also has a writable Brightness.
+#   security  a writable SecuritySystemTargetState — armed and disarmed, and
+#             only ever to a mode the accessory itself declares valid.
+#   sensor    a reading worth showing but nothing to press: contact, motion,
+#             smoke, CO, leak, occupancy, temperature, humidity.
+#
+# Everything else is left out. That is an allow-list on purpose: a bridge full
+# of camera stream-management and microphone services would otherwise bury the
+# four rows a person actually came to look at.
+#
+# A reporter. It never changes anything; the one action that does lives in
 # omarchy-homebridge-set and is called explicitly by the panel.
 #
 # The server address and credentials come from a JSON config outside the plugin
@@ -26,6 +35,11 @@ LOGIN_MAX_BYTES=1048576
 # And a ceiling on rows, so a merely enormous-but-valid reply cannot become an
 # enormous panel.
 MAX_ITEMS=300
+
+# The readings worth a row, in the order they are preferred when an accessory
+# carries more than one. A smoke sensor that also reports temperature is a smoke
+# sensor; the panel should say so rather than say 21 degrees.
+SENSOR_TYPES='["SmokeDetected","CarbonMonoxideDetected","LeakDetected","ContactSensorState","MotionDetected","OccupancyDetected","CurrentTemperature","CurrentRelativeHumidity"]'
 
 fail_json() {
   jq -n --arg error "$1" --arg config "$CONFIG" \
@@ -139,11 +153,13 @@ fi
 
 jq -e . -- "$tmp" >/dev/null 2>&1 || fail_json "Homebridge returned data that is not JSON"
 
-# Reduce the accessory list to the controllable subset, in the shape the panel
-# reads. Only accessories with a WRITABLE On characteristic and a uniqueId
-# survive — everything else cannot be toggled and has no place in a control
-# panel. Brightness is carried when the accessory also exposes a writable one.
-jq --argjson now "$NOW" --arg url "$URL" --argjson maxitems "$MAX_ITEMS" '
+# Reduce the bridged list to the three kinds above, in the shape the panel
+# reads. An accessory is classified by what it lets us do, most capable first:
+# a writable On makes it a switch, a writable SecuritySystemTargetState makes it
+# a security system, and a reading from the allow-list makes it a sensor.
+# Anything matching none of those is not a row.
+jq --argjson now "$NOW" --arg url "$URL" --arg config "$CONFIG" \
+   --argjson maxitems "$MAX_ITEMS" --argjson sensors "$SENSOR_TYPES" '
   def as_bool: (. == true) or (. == 1);
   ( if type == "array" then . else [] end )
   | map(
@@ -151,18 +167,49 @@ jq --argjson now "$NOW" --arg url "$URL" --argjson maxitems "$MAX_ITEMS" '
       | ($a.serviceCharacteristics // []) as $chars
       | (first($chars[] | select(.type == "On")) // null) as $on
       | (first($chars[] | select(.type == "Brightness")) // null) as $bri
-      | select($on != null and ($on.canWrite == true))
+      | (first($chars[] | select(.type == "SecuritySystemTargetState")) // null) as $tgt
+      | (first($chars[] | select(.type == "SecuritySystemCurrentState")) // null) as $cur
+      # Priority is the order of $sensors, not the order the server happened to
+      # list the characteristics in.
+      | (first($sensors[] as $t | $chars[] | select(.type == $t)) // null) as $sense
+      | (first($chars[] | select(.type == "StatusLowBattery")) // null) as $bat
+      | (first($chars[] | select(.type == "StatusTampered")) // null) as $tamper
+      | (first($chars[] | select(.type == "StatusFault")) // null) as $fault
+      | (if   ($on  != null and $on.canWrite  == true) then "switch"
+         elif ($tgt != null and $tgt.canWrite == true) then "security"
+         elif ($sense != null)                         then "sensor"
+         else "" end) as $kind
+      | select($kind != "")
       | select(($a.uniqueId // "") != "")
       | {
           uniqueId: $a.uniqueId,
+          kind: $kind,
           name: ($a.serviceName // $a.humanType // $a.type // "Accessory"),
           type: ($a.humanType // $a.type // ""),
-          on: ($on.value | as_bool),
-          dimmable: ($bri != null and ($bri.canWrite == true)),
-          brightness: (if $bri != null then ($bri.value // null) else null end)
+          on: (if $on != null then ($on.value | as_bool) else false end),
+          dimmable: ($kind == "switch" and $bri != null and ($bri.canWrite == true)),
+          brightness: (if $bri != null then $bri.value else null end),
+          securityCurrent: (if $cur != null then $cur.value else null end),
+          securityTarget: (if $tgt != null then $tgt.value else null end),
+          # Carried from the accessory rather than assumed: a SimpliSafe bridge
+          # declares [0,1,3] and has no Night mode at all, so a panel offering
+          # a hardcoded four would offer one the server is bound to refuse.
+          securityModes: (if $tgt != null then ($tgt.validValues // [0,1,2,3]) else [] end),
+          sensor: (if $sense != null then $sense.type else "" end),
+          sensorValue: (if $sense != null then $sense.value else null end),
+          lowBattery: (if $bat != null then ($bat.value | as_bool) else false end),
+          tampered: (if $tamper != null then ($tamper.value | as_bool) else false end),
+          fault: (if $fault != null then ($fault.value | as_bool) else false end)
         }
     )
   | .[0:$maxitems]
-  | { ok:true, error:"", configured:true, configPath:"'"$CONFIG"'", now:$now, serverUrl:$url,
-      accessories:., totals:{ count: length, on: (map(select(.on)) | length) } }
+  | { ok:true, error:"", configured:true, configPath:$config, now:$now, serverUrl:$url,
+      accessories:.,
+      totals:{
+        count: length,
+        on: ([.[] | select(.kind == "switch" and .on)] | length),
+        open: ([.[] | select(.sensor == "ContactSensorState" and .sensorValue == 1)] | length),
+        alarm: ([.[] | select(.kind == "security" and .securityCurrent == 4)] | length),
+        lowBattery: ([.[] | select(.lowBattery)] | length)
+      } }
 ' -- "$tmp"

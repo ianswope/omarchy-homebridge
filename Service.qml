@@ -44,10 +44,14 @@ Item {
   }
 
   readonly property string summary: Model.summaryText(status)
-  readonly property string barCountText: Model.barCountText(status, everLoaded)
+  readonly property string barText: Model.barText(status, everLoaded, showCount, showSecurity)
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 300)
   readonly property bool showCount: setting("showCount", true) === true
+  readonly property bool showSecurity: setting("showSecurity", true) === true
+  // HomeKit only ever reports Celsius; this is how it is read out.
+  readonly property string temperatureUnit:
+    String(setting("temperatureUnit", "Celsius")).toLowerCase() === "fahrenheit" ? "fahrenheit" : "celsius"
 
   readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string statusHelper: pluginDir + "/bin/omarchy-homebridge-status"
@@ -85,12 +89,14 @@ Item {
   function applyPending(a, now) {
     var p = pending[a.uniqueId]
     if (!p || p.until < now) return a
-    var out = {
-      uniqueId: a.uniqueId, name: a.name, type: a.type,
-      on: a.on, dimmable: a.dimmable, brightness: a.brightness
-    }
+    // Copied wholesale rather than field by field: a named list here silently
+    // drops whatever the accessory grows next, and a row that loses its kind
+    // stops rendering as anything.
+    var out = {}
+    for (var k in a) out[k] = a[k]
     if (p.on !== undefined) out.on = p.on
     if (p.brightness !== undefined) { out.brightness = p.brightness; out.dimmable = true }
+    if (p.securityTarget !== undefined) out.securityTarget = p.securityTarget
     return out
   }
 
@@ -117,7 +123,8 @@ Item {
       if (!settled && real) {
         var onMatches = (p.on === undefined) || (real.on === p.on)
         var briMatches = (p.brightness === undefined) || (real.brightness === p.brightness)
-        if (onMatches && briMatches) settled = true
+        var secMatches = (p.securityTarget === undefined) || (real.securityTarget === p.securityTarget)
+        if (onMatches && briMatches && secMatches) settled = true
       }
       if (settled) { delete pending[id]; changed = true }
     }
@@ -202,6 +209,22 @@ Item {
     settleTimer.restart()
   }
 
+  // Arming and disarming. The panel asks before calling this — see the confirm
+  // dialog in Panel.qml — because unlike a lamp, getting this one wrong leaves a
+  // house unlocked. What is made optimistic is the *target*, not the current
+  // state: a system takes its time arming, and claiming the house is secure
+  // before it is would be the one lie this panel must never tell.
+  function setSecurity(accessory, target) {
+    if (!accessory) return
+    if (!Model.isSafeUniqueId(accessory.uniqueId)) { note("That accessory has an id Homebridge will not accept back"); return }
+    if (!Model.isSafeSecurityTarget(target)) { note("That is not a mode this can set"); return }
+    setPending(accessory.uniqueId, { securityTarget: target })
+    enqueue(["bash", setHelper, configFile, String(accessory.uniqueId), "SecuritySystemTargetState", String(target)],
+            (target === 3 ? "Disarming " : "Setting ") + accessory.name
+              + (target === 3 ? "" : " to " + Model.securityLabel(target)))
+    securitySettleTimer.restart()
+  }
+
   // Signing in writes a credential and asks for a password, so it runs in a
   // visible terminal rather than silently behind the panel.
   function signIn() {
@@ -239,6 +262,23 @@ Item {
       ticks += 1
       root.refresh()
       if (ticks >= 4) running = false
+    }
+  }
+
+  // Arming is not a toggle. An away mode gives you a minute to get out of the
+  // house, and the panel should follow that the whole way rather than checking
+  // four times in three seconds and then losing interest.
+  Timer {
+    id: securitySettleTimer
+    property int ticks: 0
+    interval: 3000
+    repeat: true
+    running: false
+    onRunningChanged: if (running) ticks = 0
+    onTriggered: {
+      ticks += 1
+      root.refresh()
+      if (ticks >= 30) running = false
     }
   }
 
