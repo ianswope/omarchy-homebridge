@@ -33,7 +33,7 @@ CURL_DEADLINE=8
 LOGIN_MAX_BYTES=1048576
 
 fail_json() {
-  jq -n --arg error "$1" '{ok:false, error:$error}'
+  "$HB_JQ" -n --arg error "$1" '{ok:false, error:$error}'
   exit 0
 }
 
@@ -43,8 +43,8 @@ if ! source "$CONFIG_LIB" 2>/dev/null; then
   exit 0
 fi
 
-command -v jq >/dev/null 2>&1 || { printf '{"ok":false,"error":"jq is not installed"}\n'; exit 0; }
-command -v curl >/dev/null 2>&1 || { printf '{"ok":false,"error":"curl is not installed"}\n'; exit 0; }
+[[ -x $HB_JQ ]] || { printf '{"ok":false,"error":"jq is not installed"}\n'; exit 0; }
+[[ -x $HB_CURL ]] || { printf '{"ok":false,"error":"curl is not installed"}\n'; exit 0; }
 
 [[ $CONFIG == /* ]] || fail_json "config path must be absolute: $CONFIG"
 
@@ -93,9 +93,9 @@ esac
 CONFIG_JSON=$(read_config_json "$CONFIG")
 read_rc=$?
 (( read_rc == 0 )) || fail_json "$(config_read_error "$read_rc" "$CONFIG")"
-jq -e . <<<"$CONFIG_JSON" >/dev/null 2>&1 || fail_json "config is not valid JSON: $CONFIG"
+"$HB_JQ" -e . <<<"$CONFIG_JSON" >/dev/null 2>&1 || fail_json "config is not valid JSON: $CONFIG"
 
-URL=$(jq -r '.url // ""' <<<"$CONFIG_JSON")
+URL=$("$HB_JQ" -r '.url // ""' <<<"$CONFIG_JSON")
 [[ -n $URL ]] || fail_json "no \"url\" in $CONFIG"
 if [[ $URL != http://* && $URL != https://* ]]; then
   fail_json "url must begin with http:// or https://"
@@ -103,8 +103,8 @@ fi
 is_safe_config_value "$URL" || fail_json "the url in $CONFIG contains characters that cannot be used safely"
 URL="${URL%/}"
 
-login_err=$(mktemp -t omarchy-homebridge-loginerr.XXXXXX) || fail_json "cannot create a temporary file"
-body=$(mktemp -t omarchy-homebridge-put.XXXXXX) || { rm -f "$login_err"; fail_json "cannot create a temporary file"; }
+login_err=$("$HB_MKTEMP" -t omarchy-homebridge-loginerr.XXXXXX) || fail_json "cannot create a temporary file"
+body=$("$HB_MKTEMP" -t omarchy-homebridge-put.XXXXXX) || { rm -f "$login_err"; fail_json "cannot create a temporary file"; }
 chmod 600 -- "$body" 2>/dev/null
 trap 'rm -f "$login_err" "$body"' EXIT
 
@@ -115,16 +115,17 @@ fi
 
 # The body is built by jq with the proven literal, so its JSON is well formed
 # and its value is exactly what was validated above.
-jq -n --arg ct "$CHAR_TYPE" --argjson v "$VALUE_JSON" '{characteristicType:$ct, value:$v}' > "$body" \
+"$HB_JQ" -n --arg ct "$CHAR_TYPE" --argjson v "$VALUE_JSON" '{characteristicType:$ct, value:$v}' > "$body" \
   || fail_json "could not encode the request"
 
-NOW=$(date +%s)
+NOW=$("$HB_DATE" +%s)
 
 put_characteristic() {
   # Token and body reach curl through a stdin config document; neither the
-  # bearer token nor anything else is on the command line.
+  # bearer token nor anything else is on the command line. -q comes first so
+  # ~/.curlrc cannot add a second `url =` that the token header would follow.
   printf 'request = "PUT"\nheader = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\nheader = "Accept: application/json"\nurl = "%s/api/accessories/%s"\ndata = "@%s"\nmax-time = %s\noutput = "/dev/null"\nsilent\nshow-error\nwrite-out = "%%{http_code}"\n' \
-    "$HB_TOKEN" "$URL" "$UNIQUE_ID" "$body" "$CURL_DEADLINE" | curl --config - 2>/dev/null
+    "$HB_TOKEN" "$URL" "$UNIQUE_ID" "$body" "$CURL_DEADLINE" | "$HB_CURL" -q --config - 2>/dev/null
 }
 
 http_code=$(put_characteristic)
@@ -132,11 +133,11 @@ curl_status=$?
 
 # A cached token rejected before expiry: one forced re-login and retry.
 if (( curl_status == 0 )) && [[ $http_code == 401 ]]; then
-  login_json=$(hb_login "$LOGIN_MAX_BYTES" "$URL" "$(jq -r '.username // ""' <<<"$CONFIG_JSON")" "$(jq -r '.password // ""' <<<"$CONFIG_JSON")" "$CURL_DEADLINE" 2>/dev/null)
-  new_token=$(jq -r '.access_token // empty' <<<"$login_json" 2>/dev/null)
+  login_json=$(hb_login "$LOGIN_MAX_BYTES" "$URL" "$("$HB_JQ" -r '.username // ""' <<<"$CONFIG_JSON")" "$("$HB_JQ" -r '.password // ""' <<<"$CONFIG_JSON")" "$CURL_DEADLINE" 2>/dev/null)
+  new_token=$("$HB_JQ" -r '.access_token // empty' <<<"$login_json" 2>/dev/null)
   if is_jwt "$new_token"; then
     HB_TOKEN="$new_token"
-    ttl=$(jq -r '.expires_in // empty' <<<"$login_json" 2>/dev/null); is_number "$ttl" || ttl=$TOKEN_DEFAULT_TTL
+    ttl=$("$HB_JQ" -r '.expires_in // empty' <<<"$login_json" 2>/dev/null); is_number "$ttl" || ttl=$TOKEN_DEFAULT_TTL
     (( ttl > TOKEN_MAX_TTL )) && ttl=$TOKEN_MAX_TTL
     hb_persist_token "$CONFIG" "$CONFIG_JSON" "$new_token" "$(( NOW + ttl - TOKEN_SAFETY_MARGIN ))" 2>/dev/null || true
     http_code=$(put_characteristic)

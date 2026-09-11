@@ -42,7 +42,7 @@ MAX_ITEMS=300
 SENSOR_TYPES='["SmokeDetected","CarbonMonoxideDetected","LeakDetected","ContactSensorState","MotionDetected","OccupancyDetected","CurrentTemperature","CurrentRelativeHumidity"]'
 
 fail_json() {
-  jq -n --arg error "$1" --arg config "$CONFIG" \
+  "$HB_JQ" -n --arg error "$1" --arg config "$CONFIG" \
     '{ok:false, error:$error, configured:true, configPath:$config, accessories:[], totals:{}}'
   exit 0
 }
@@ -53,8 +53,8 @@ if ! source "$CONFIG_LIB" 2>/dev/null; then
   exit 0
 fi
 
-command -v jq >/dev/null 2>&1 || { printf '{"ok":false,"error":"jq is not installed","accessories":[]}\n'; exit 0; }
-command -v curl >/dev/null 2>&1 || { printf '{"ok":false,"error":"curl is not installed","accessories":[]}\n'; exit 0; }
+[[ -x $HB_JQ ]] || { printf '{"ok":false,"error":"jq is not installed","accessories":[]}\n'; exit 0; }
+[[ -x $HB_CURL ]] || { printf '{"ok":false,"error":"curl is not installed","accessories":[]}\n'; exit 0; }
 
 # An absolute path is required: a leading dash would be read as an option
 # downstream, and a relative path means whatever directory the shell started in.
@@ -69,15 +69,15 @@ read_rc=$?
 if (( read_rc == 1 )); then
   # Not an error: a fresh install has nothing configured yet, and the panel says
   # so with the path to create.
-  jq -n --arg config "$CONFIG" \
+  "$HB_JQ" -n --arg config "$CONFIG" \
     '{ok:true, error:"", configured:false, configPath:$config, now:0, serverUrl:"", accessories:[], totals:{count:0, on:0}}'
   exit 0
 fi
 (( read_rc == 0 )) || fail_json "$(config_read_error "$read_rc" "$CONFIG")"
 
-jq -e . <<<"$CONFIG_JSON" >/dev/null 2>&1 || fail_json "config is not valid JSON: $CONFIG"
+"$HB_JQ" -e . <<<"$CONFIG_JSON" >/dev/null 2>&1 || fail_json "config is not valid JSON: $CONFIG"
 
-URL=$(jq -r '.url // ""' <<<"$CONFIG_JSON")
+URL=$("$HB_JQ" -r '.url // ""' <<<"$CONFIG_JSON")
 [[ -n $URL ]] || fail_json "no \"url\" in $CONFIG"
 if [[ $URL != http://* && $URL != https://* ]]; then
   fail_json "url must begin with http:// or https://"
@@ -89,26 +89,28 @@ URL="${URL%/}"
 # or near expiry. hb_ensure_token persists a refreshed token back to the config
 # and sets HB_TOKEN in this shell, so it is called directly rather than in a
 # subshell — its stderr is captured through an mktemp'd file, not a $$ path.
-login_err=$(mktemp -t omarchy-homebridge-loginerr.XXXXXX) || fail_json "cannot create a temporary file"
+login_err=$("$HB_MKTEMP" -t omarchy-homebridge-loginerr.XXXXXX) || fail_json "cannot create a temporary file"
 trap 'rm -f "$login_err"' EXIT
 if ! hb_ensure_token "$LOGIN_MAX_BYTES" "$CONFIG" "$CONFIG_JSON" "$CURL_DEADLINE" 2>"$login_err"; then
   err=$(tr -cd '[:print:]' < "$login_err" 2>/dev/null | cut -c1-160)
   fail_json "${err:-could not sign in to Homebridge}"
 fi
 
-NOW=$(date +%s)
+NOW=$("$HB_DATE" +%s)
 
 # The token goes in a header read from a --config document on stdin, never on
 # the command line: curl's argv is visible in /proc, and this is a bearer token.
+# -q comes first so ~/.curlrc is never read: a line there could add a second
+# `url =` and this poll would send the bearer token to it every few seconds.
 # The body lands in a file and is refused past MAX_BYTES; whatever answers on
 # that port is not necessarily a healthy Homebridge, and reading an unbounded
 # reply into memory on a timer is how a widget takes the machine down.
-tmp=$(mktemp -t omarchy-homebridge-status.XXXXXX) || fail_json "cannot create a temporary file"
+tmp=$("$HB_MKTEMP" -t omarchy-homebridge-status.XXXXXX) || fail_json "cannot create a temporary file"
 trap 'rm -f "$tmp" "$login_err"' EXIT
 
 get_accessories() {
   printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\nurl = "%s/api/accessories"\nmax-time = %s\nmax-filesize = %s\noutput = "%s"\nsilent\nshow-error\nwrite-out = "%%{http_code}"\n' \
-    "$HB_TOKEN" "$URL" "$CURL_DEADLINE" "$MAX_BYTES" "$tmp" | curl --config - 2>/dev/null
+    "$HB_TOKEN" "$URL" "$CURL_DEADLINE" "$MAX_BYTES" "$tmp" | "$HB_CURL" -q --config - 2>/dev/null
 }
 
 http_code=$(get_accessories)
@@ -124,11 +126,11 @@ fi
 # A cached token can be rejected before its own expiry — config-ui-x restarted,
 # or its secret rotated. One forced re-login and retry, then give up.
 if [[ $http_code == 401 ]]; then
-  login_json=$(hb_login "$LOGIN_MAX_BYTES" "$URL" "$(jq -r '.username // ""' <<<"$CONFIG_JSON")" "$(jq -r '.password // ""' <<<"$CONFIG_JSON")" "$CURL_DEADLINE" 2>/dev/null)
-  new_token=$(jq -r '.access_token // empty' <<<"$login_json" 2>/dev/null)
+  login_json=$(hb_login "$LOGIN_MAX_BYTES" "$URL" "$("$HB_JQ" -r '.username // ""' <<<"$CONFIG_JSON")" "$("$HB_JQ" -r '.password // ""' <<<"$CONFIG_JSON")" "$CURL_DEADLINE" 2>/dev/null)
+  new_token=$("$HB_JQ" -r '.access_token // empty' <<<"$login_json" 2>/dev/null)
   if is_jwt "$new_token"; then
     HB_TOKEN="$new_token"
-    ttl=$(jq -r '.expires_in // empty' <<<"$login_json" 2>/dev/null); is_number "$ttl" || ttl=$TOKEN_DEFAULT_TTL
+    ttl=$("$HB_JQ" -r '.expires_in // empty' <<<"$login_json" 2>/dev/null); is_number "$ttl" || ttl=$TOKEN_DEFAULT_TTL
     (( ttl > TOKEN_MAX_TTL )) && ttl=$TOKEN_MAX_TTL
     hb_persist_token "$CONFIG" "$CONFIG_JSON" "$new_token" "$(( NOW + ttl - TOKEN_SAFETY_MARGIN ))" 2>/dev/null || true
     http_code=$(get_accessories)
@@ -139,7 +141,7 @@ fi
 
 # max-filesize only acts on a declared Content-Length, so a chunked reply can
 # still overrun it. The size on disk is the fact that cannot be lied about.
-size=$(stat -c %s -- "$tmp" 2>/dev/null || echo 0)
+size=$("$HB_STAT" -c %s -- "$tmp" 2>/dev/null || echo 0)
 if (( size > MAX_BYTES )); then
   fail_json "Homebridge returned more than $((MAX_BYTES / 1024)) KB of accessory data"
 fi
@@ -151,14 +153,14 @@ if [[ $http_code != 200 ]]; then
   fail_json "Homebridge answered HTTP $http_code"
 fi
 
-jq -e . -- "$tmp" >/dev/null 2>&1 || fail_json "Homebridge returned data that is not JSON"
+"$HB_JQ" -e . -- "$tmp" >/dev/null 2>&1 || fail_json "Homebridge returned data that is not JSON"
 
 # Reduce the bridged list to the three kinds above, in the shape the panel
 # reads. An accessory is classified by what it lets us do, most capable first:
 # a writable On makes it a switch, a writable SecuritySystemTargetState makes it
 # a security system, and a reading from the allow-list makes it a sensor.
 # Anything matching none of those is not a row.
-jq --argjson now "$NOW" --arg url "$URL" --arg config "$CONFIG" \
+"$HB_JQ" --argjson now "$NOW" --arg url "$URL" --arg config "$CONFIG" \
    --argjson maxitems "$MAX_ITEMS" --argjson sensors "$SENSOR_TYPES" '
   def as_bool: (. == true) or (. == 1);
   ( if type == "array" then . else [] end )

@@ -306,6 +306,26 @@ assert_eq "$(jq -r '.configured' <<<"$dead_out")" "true" 'but not an unconfigure
 assert_contains "$(jq -r '.error' <<<"$dead_out")" "127.0.0.1:1" 'and the message names the address that did not answer'
 assert_contains "$(jq -r '.error' <<<"$(set_helper "$WORK/dead.json" "ff00ff00ff" On true)")" "127.0.0.1:1" 'a write to an unreachable server fails the same way'
 
+# ------------------------------------------------------- a hostile PATH
+
+# The credential path is pinned to /usr/bin, so a curl or jq planted earlier in
+# PATH by anything running as this user never sees the password or the bearer
+# token. This plants both and proves the poll still works and the shims were
+# never reached -- a PATH-resolved curl would have received the Authorization
+# header, which is why this is a test and not a comment.
+SHIM="$WORK/shim"
+mkdir -p "$SHIM"
+for exe in curl jq dd stat mktemp date cat; do
+  printf '#!/bin/bash\ntouch -- "%s/.called-%s"\nexit 0\n' "$SHIM" "$exe" > "$SHIM/$exe"
+  chmod +x "$SHIM/$exe"
+done
+
+shim_out=$(PATH="$SHIM:$PATH" bash "$BIN/omarchy-homebridge-status" "$CONFIG")
+assert_eq "$(jq -r '.ok' <<<"$shim_out")" "true" 'a poll survives a hostile PATH'
+assert_eq "$(jq -r '.accessories | length' <<<"$shim_out")" "11" 'and returns the real accessories'
+assert "$([[ -n $(ls -A "$SHIM"/.called-* 2>/dev/null) ]] && echo 1 || echo 0)" \
+  'and no planted binary on the credential path was ever run'
+
 printf '\n'
 if (( failures == 0 )); then
   printf 'all passed\n'

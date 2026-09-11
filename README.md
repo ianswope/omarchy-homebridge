@@ -135,6 +135,8 @@ The credential is real and the writes are real — and one of them is a burglar 
 * Replies are **bounded twice** (declared size and size-on-disk), because a chunked reply can overrun a `Content-Length` limit.
 * The config is written through an `mktemp`/`O_EXCL` file and `mv`'d into place, so an interrupted write cannot leave a half-written credential and no predictable name can be pre-planted as a symlink.
 * Accessory names come off the server and reach a QML `Text`, which defaults to `AutoText` — so they are stripped of markup at the one parse boundary they cross.
+* **`curl` is given `-q` first, so `~/.curlrc` is never read.** That file is writable by anything running as this user, and a line in it can add a second `url =` to a request — which the `Authorization` header written on stdin would then follow. A poll every few seconds makes that a standing leak rather than a one-off.
+* **Every binary on the credential path is an absolute `/usr/bin` path**, not a name resolved through `PATH`. A shadow `curl` planted ahead of the real one receives the bearer token; a shadow `jq` writes the login body. `test/helpers-test.sh` plants both and proves neither is reached.
 
 ## Tests
 
@@ -143,7 +145,7 @@ node test/model-test.js     # what the panel decides, on plain data
 bash test/helpers-test.sh   # the helpers, against a stand-in Homebridge
 ```
 
-`model-test.js` runs `Model.js` under `node` with no shell, no bar and no server. `helpers-test.sh` starts `test/fake-homebridge.py` — a small stand-in for config-ui-x that speaks the three routes this plugin uses and keeps accessory state in memory — on a loopback port, signs in against it for real, and then checks both what the helpers printed and what the server saw: that a cached token is reused rather than re-fetched, that a token rejected before its expiry triggers one re-login and retry, that a `PUT` is visible in the next poll, that a house mid-arming reports itself mid-arming, and that a refused value never reaches the server at all. Every config it writes lives in a `mktemp` directory; nothing touches `~/.config/omarchy-homebridge`. `python3` is needed for the second one.
+`model-test.js` runs `Model.js` under `node` with no shell, no bar and no server. `helpers-test.sh` starts `test/fake-homebridge.py` — a small stand-in for config-ui-x that speaks the three routes this plugin uses and keeps accessory state in memory — on a loopback port, signs in against it for real, and then checks both what the helpers printed and what the server saw: that a cached token is reused rather than re-fetched, that a token rejected before its expiry triggers one re-login and retry, that a `PUT` is visible in the next poll, that a house mid-arming reports itself mid-arming, that a refused value never reaches the server at all, and that a poll still succeeds — untouched — with a hostile `PATH` in front of it. Every config it writes lives in a `mktemp` directory; nothing touches `~/.config/omarchy-homebridge`. `python3` is needed for the second one.
 
 ## Settings
 

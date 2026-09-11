@@ -12,6 +12,18 @@
 # device (set). So it is read once, through one primitive, and only the bytes
 # that came back are parsed — never the path again.
 
+# Absolute paths, so a PATH another process prepended to cannot substitute the
+# curl that carries the password and the bearer token. Every binary on the
+# credential path is pinned, not only the one the secret is handed to: a shadow
+# `jq` writes the login body, and a shadow `dd` reads the config it came from.
+HB_CURL=/usr/bin/curl
+HB_JQ=/usr/bin/jq
+HB_DD=/usr/bin/dd
+HB_STAT=/usr/bin/stat
+HB_MKTEMP=/usr/bin/mktemp
+HB_DATE=/usr/bin/date
+HB_CAT=/usr/bin/cat
+
 # A url, a username, a password, a JWT and an expiry. A file past this is not
 # this file.
 CONFIG_MAX_BYTES=65536
@@ -84,7 +96,7 @@ read_config_json() {
   [[ -L $path ]] && return 2
   [[ -e $path ]] || return 1
   [[ -f $path ]] || return 2
-  bytes=$(dd if="$path" iflag=nofollow,nonblock bs=4096 count="$CONFIG_READ_BLOCKS" status=none 2>/dev/null) || return 2
+  bytes=$("$HB_DD" if="$path" iflag=nofollow,nonblock bs=4096 count="$CONFIG_READ_BLOCKS" status=none 2>/dev/null) || return 2
   (( ${#bytes} > CONFIG_MAX_BYTES )) && return 3
   printf '%s' "$bytes"
   return 0
@@ -105,18 +117,23 @@ config_read_error() {
 # file rather than $( ), because a command substitution has nowhere to put a
 # refusal.
 #
+# -q is first, so ~/.curlrc is not read. Without it a line in that file --
+# writable by anything running as this user -- can add a second `url =` to the
+# request, and the Authorization header (or the login body) goes there too. A
+# credential on the wire is what makes -q a requirement rather than a taste.
+#
 # 0 with the body in $1, 3 when the far end sent more than $2 bytes, 1 for
 # everything else — unreachable, timed out, refused.
 fetch_bounded() {
   local dest="$1" max="$2"; shift 2
   : > "$dest" || return 1
-  curl "$@" --max-filesize "$max" --output "$dest"
+  "$HB_CURL" -q "$@" --max-filesize "$max" --output "$dest"
   local status=$?
   # 63 is curl's own max-filesize refusal, a different fault from unreachable.
   (( status == 63 )) && return 3
   (( status == 0 )) || return 1
   local size
-  size=$(stat -c %s -- "$dest" 2>/dev/null || echo 0)
+  size=$("$HB_STAT" -c %s -- "$dest" 2>/dev/null || echo 0)
   (( size > max )) && return 3
   return 0
 }
@@ -141,15 +158,15 @@ hb_login() {
   url="${url%/}"
 
   local body reply
-  body=$(mktemp -t omarchy-homebridge-login.XXXXXX) || { printf 'cannot create a temporary file\n' >&2; return 1; }
-  reply=$(mktemp -t omarchy-homebridge-reply.XXXXXX) || { rm -f -- "$body"; printf 'cannot create a temporary file\n' >&2; return 1; }
+  body=$("$HB_MKTEMP" -t omarchy-homebridge-login.XXXXXX) || { printf 'cannot create a temporary file\n' >&2; return 1; }
+  reply=$("$HB_MKTEMP" -t omarchy-homebridge-reply.XXXXXX) || { rm -f -- "$body"; printf 'cannot create a temporary file\n' >&2; return 1; }
   # Note the subshell-free cleanup: this function is sourced into helpers that
   # set their own EXIT traps, so it removes its own temporaries by hand.
   chmod 600 -- "$body" "$reply" 2>/dev/null
 
   # jq builds the body, so a password with quotes, backslashes or braces is
   # escaped into valid JSON rather than breaking it.
-  if ! jq -n --arg u "$user" --arg p "$pass" '{username:$u, password:$p}' > "$body"; then
+  if ! "$HB_JQ" -n --arg u "$user" --arg p "$pass" '{username:$u, password:$p}' > "$body"; then
     rm -f -- "$body" "$reply"; printf 'could not encode the login request\n' >&2; return 1
   fi
 
@@ -168,13 +185,13 @@ hb_login() {
   # fetch_bounded overwrote the body with the response; the trailing http_code
   # came back on the (now consumed) pipe. Re-check the status by parsing.
   local token
-  token=$(jq -r '.access_token // empty' -- "$reply" 2>/dev/null)
+  token=$("$HB_JQ" -r '.access_token // empty' -- "$reply" 2>/dev/null)
   if [[ -z $token ]]; then
     rm -f -- "$reply"
     printf 'Homebridge rejected the credentials\n' >&2
     return 1
   fi
-  cat -- "$reply"
+  "$HB_CAT" -- "$reply"
   rm -f -- "$reply"
   return 0
 }
@@ -187,10 +204,10 @@ hb_login() {
 # $1 config-path  $2 config-json (current bytes)  $3 token  $4 expires-epoch
 hb_persist_token() {
   local path="$1" current="$2" token="$3" expires="$4" tmp
-  tmp=$(mktemp -- "$(dirname -- "$path")/.write.XXXXXX") || return 1
+  tmp=$("$HB_MKTEMP" -- "$(dirname -- "$path")/.write.XXXXXX") || return 1
   chmod 600 -- "$tmp" 2>/dev/null
-  if [[ -n $current ]] && jq -e . <<<"$current" >/dev/null 2>&1; then
-    jq --arg t "$token" --argjson e "$expires" '. + {token:$t, token_expires:$e}' <<<"$current" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  if [[ -n $current ]] && "$HB_JQ" -e . <<<"$current" >/dev/null 2>&1; then
+    "$HB_JQ" --arg t "$token" --argjson e "$expires" '. + {token:$t, token_expires:$e}' <<<"$current" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   else
     rm -f -- "$tmp"; return 1
   fi
@@ -208,13 +225,13 @@ hb_persist_token() {
 hb_ensure_token() {
   local max="$1" path="$2" json="$3" deadline="${4:-10}"
   local url user pass token expires now
-  url=$(jq -r '.url // ""' <<<"$json")
-  user=$(jq -r '.username // ""' <<<"$json")
-  pass=$(jq -r '.password // ""' <<<"$json")
-  token=$(jq -r '.token // ""' <<<"$json")
-  expires=$(jq -r '.token_expires // 0' <<<"$json")
+  url=$("$HB_JQ" -r '.url // ""' <<<"$json")
+  user=$("$HB_JQ" -r '.username // ""' <<<"$json")
+  pass=$("$HB_JQ" -r '.password // ""' <<<"$json")
+  token=$("$HB_JQ" -r '.token // ""' <<<"$json")
+  expires=$("$HB_JQ" -r '.token_expires // 0' <<<"$json")
   is_number "$expires" || expires=0
-  now=$(date +%s)
+  now=$("$HB_DATE" +%s)
 
   if [[ -n $token ]] && is_jwt "$token" && (( expires > now + TOKEN_SAFETY_MARGIN )); then
     HB_TOKEN="$token"; return 0
@@ -222,8 +239,8 @@ hb_ensure_token() {
 
   local login_json new_token ttl new_expires
   login_json=$(hb_login "$max" "$url" "$user" "$pass" "$deadline") || return 1
-  new_token=$(jq -r '.access_token // empty' <<<"$login_json" 2>/dev/null)
-  ttl=$(jq -r '.expires_in // empty' <<<"$login_json" 2>/dev/null)
+  new_token=$("$HB_JQ" -r '.access_token // empty' <<<"$login_json" 2>/dev/null)
+  ttl=$("$HB_JQ" -r '.expires_in // empty' <<<"$login_json" 2>/dev/null)
   is_jwt "$new_token" || { printf 'the token Homebridge returned has unexpected characters\n' >&2; return 1; }
   is_number "$ttl" || ttl=$TOKEN_DEFAULT_TTL
   (( ttl > TOKEN_MAX_TTL )) && ttl=$TOKEN_MAX_TTL

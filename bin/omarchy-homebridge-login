@@ -25,8 +25,8 @@ die() { printf '\n%s\n' "$1" >&2; exit 1; }
 CONFIG_LIB="${BASH_SOURCE[0]%/*}/homebridge-config.sh"
 source "$CONFIG_LIB" 2>/dev/null || die "Cannot read homebridge-config.sh next to this helper."
 
-command -v jq >/dev/null 2>&1 || die "jq is not installed."
-command -v curl >/dev/null 2>&1 || die "curl is not installed."
+[[ -x $HB_JQ ]] || die "jq is not installed."
+[[ -x $HB_CURL ]] || die "curl is not installed."
 [[ $CONFIG == /* ]] || die "Config path must be absolute: $CONFIG"
 
 # Read any existing config through the same bounded, no-follow reader the other
@@ -42,9 +42,9 @@ fi
 
 prev_url=""
 prev_user=""
-if [[ -n $existing_json ]] && jq -e . <<<"$existing_json" >/dev/null 2>&1; then
-  prev_url=$(jq -r '.url // ""' <<<"$existing_json")
-  prev_user=$(jq -r '.username // ""' <<<"$existing_json")
+if [[ -n $existing_json ]] && "$HB_JQ" -e . <<<"$existing_json" >/dev/null 2>&1; then
+  prev_url=$("$HB_JQ" -r '.url // ""' <<<"$existing_json")
+  prev_user=$("$HB_JQ" -r '.username // ""' <<<"$existing_json")
 fi
 
 default_url="${prev_url:-$DEFAULT_URL}"
@@ -80,18 +80,18 @@ printf '\n'
 printf '\nVerifying with %s ...\n' "$url"
 login_json=$(hb_login "$LOGIN_MAX_BYTES" "$url" "$user" "$pass" 15) \
   || die "Sign-in failed. Check the URL, username and password and try again."
-token=$(jq -r '.access_token // empty' <<<"$login_json" 2>/dev/null)
+token=$("$HB_JQ" -r '.access_token // empty' <<<"$login_json" 2>/dev/null)
 is_jwt "$token" || die "The server returned a token with unexpected characters."
 
 # A quick, best-effort look at how many accessories the account can see. Never
 # fatal — the credential is already proven — but a friendlier confirmation than
 # a bare "signed in", and it proves the token works on the real endpoint too.
 count_note=""
-acc_tmp=$(mktemp -t omarchy-homebridge-login-acc.XXXXXX) 2>/dev/null
+acc_tmp=$("$HB_MKTEMP" -t omarchy-homebridge-login-acc.XXXXXX) 2>/dev/null
 if [[ -n $acc_tmp ]]; then
   if printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\nurl = "%s/api/accessories"\nmax-time = 15\noutput = "%s"\nsilent\n' \
-       "$token" "$url" "$acc_tmp" | curl --config - --max-filesize 2097152 >/dev/null 2>&1; then
-    n=$(jq '[.[] | select(.serviceCharacteristics // [] | any(.type == "On" and .canWrite == true))] | length' -- "$acc_tmp" 2>/dev/null)
+       "$token" "$url" "$acc_tmp" | "$HB_CURL" -q --config - --max-filesize 2097152 >/dev/null 2>&1; then
+    n=$("$HB_JQ" '[.[] | select(.serviceCharacteristics // [] | any(.type == "On" and .canWrite == true))] | length' -- "$acc_tmp" 2>/dev/null)
     [[ $n =~ ^[0-9]+$ ]] && count_note=" It can control $n accessor$([[ $n == 1 ]] && echo y || echo ies)."
   fi
   rm -f -- "$acc_tmp"
@@ -104,16 +104,16 @@ mkdir -p "$(dirname -- "$CONFIG")" || die "Cannot create $(dirname -- "$CONFIG")
 # pre-plant a symlink at a predictable name to divert it. Existing fields are
 # preserved; the token is deliberately dropped so the first poll logs in fresh
 # for whatever server we just pointed at.
-config_tmp=$(mktemp -- "$(dirname -- "$CONFIG")/.write.XXXXXX") || die "Cannot create a temporary file in $(dirname -- "$CONFIG")"
+config_tmp=$("$HB_MKTEMP" -- "$(dirname -- "$CONFIG")/.write.XXXXXX") || die "Cannot create a temporary file in $(dirname -- "$CONFIG")"
 chmod 600 -- "$config_tmp" 2>/dev/null
 trap 'rm -f -- "$config_tmp"' EXIT
 
-if [[ -n $existing_json ]] && jq -e . <<<"$existing_json" >/dev/null 2>&1; then
-  jq --arg url "$url" --arg u "$user" --arg p "$pass" \
+if [[ -n $existing_json ]] && "$HB_JQ" -e . <<<"$existing_json" >/dev/null 2>&1; then
+  "$HB_JQ" --arg url "$url" --arg u "$user" --arg p "$pass" \
     '. + {url:$url, username:$u, password:$p} | del(.token, .token_expires)' <<<"$existing_json" > "$config_tmp" \
     || die "Could not write $config_tmp"
 else
-  jq -n --arg url "$url" --arg u "$user" --arg p "$pass" \
+  "$HB_JQ" -n --arg url "$url" --arg u "$user" --arg p "$pass" \
     '{url:$url, username:$u, password:$p}' > "$config_tmp" || die "Could not write $config_tmp"
 fi
 chmod 600 -- "$config_tmp"
